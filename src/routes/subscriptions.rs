@@ -1,7 +1,10 @@
 use actix_web::{web, HttpResponse};
 use chrono::Utc;
 use sqlx::PgPool;
+use unicode_segmentation::UnicodeSegmentation;
 use uuid::Uuid;
+
+use crate::domain::{NewSubscriber, SubscriberEmail, SubscriberName};
 
 #[derive(serde::Deserialize)]
 pub struct FormData {
@@ -9,8 +12,18 @@ pub struct FormData {
     name: String,
 }
 
+impl TryFrom<FormData> for NewSubscriber {
+    type Error = String;
+
+    fn try_from(value: FormData) -> Result<Self, Self::Error> {
+        let name = SubscriberName::parse(value.name)?;
+        let email = SubscriberEmail::parse(value.email)?;
+        Ok(Self { email, name })
+    }
+}
+
 #[tracing::instrument(
-    name = "Adding a new subsriber",
+    name = "Adding a new subscriber",
     skip(form, db_pool),
     fields(
         subscriber_email = %form.email,
@@ -18,22 +31,39 @@ pub struct FormData {
     )
 )]
 pub async fn subscribe(form: web::Form<FormData>, db_pool: web::Data<PgPool>) -> HttpResponse {
-    match insert_subscriber(&db_pool, &form).await {
+    let new_subscriber = match form.0.try_into() {
+        Ok(subscriber) => subscriber,
+        Err(_) => return HttpResponse::BadRequest().finish(),
+    };
+
+    match insert_subscriber(&db_pool, &new_subscriber).await {
         Ok(_) => HttpResponse::Ok().finish(),
         Err(_) => HttpResponse::InternalServerError().finish(),
     }
 }
 
-#[tracing::instrument(name = "Saving new subscriber details in the db", skip(form, db_pool))]
-pub async fn insert_subscriber(db_pool: &PgPool, form: &FormData) -> Result<(), sqlx::Error> {
+// pub fn parse_subscriber(form: FormData) -> Result<NewSubscriber, String> {
+//     let name = SubscriberName::parse(form.name)?;
+//     let email = SubscriberEmail::parse(form.email)?;
+//     Ok(NewSubscriber { email, name })
+// }
+
+#[tracing::instrument(
+    name = "Saving new subscriber details in the db",
+    skip(new_subscriber, db_pool)
+)]
+pub async fn insert_subscriber(
+    db_pool: &PgPool,
+    new_subscriber: &NewSubscriber,
+) -> Result<(), sqlx::Error> {
     sqlx::query!(
         r#"
         INSERT INTO subscriptions (id, email, name, subscribed_at)
         VALUES ($1, $2, $3, $4)
         "#,
         Uuid::new_v4(),
-        form.email,
-        form.name,
+        new_subscriber.email.as_ref(),
+        new_subscriber.name.as_ref(),
         Utc::now()
     )
     .execute(db_pool)
@@ -43,4 +73,16 @@ pub async fn insert_subscriber(db_pool: &PgPool, form: &FormData) -> Result<(), 
         e
     })?;
     Ok(())
+}
+
+pub fn is_valid_name(s: &str) -> bool {
+    let is_empty_or_whitespace = s.trim().is_empty();
+
+    let is_too_long = s.graphemes(true).count() > 256;
+
+    let forbidden_characters = ['/', '(', ')', '"', '<', '>', '\\', '{', '}'];
+
+    let contains_forbidden_characters = s.chars().any(|g| forbidden_characters.contains(&g));
+
+    !(is_empty_or_whitespace || is_too_long || contains_forbidden_characters)
 }
